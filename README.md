@@ -10,6 +10,10 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 目标环境**：逐环境复用 `/resolve` 的全部规则求解，返回按 `id` 排序的各环境
 锁定清单，以及按包名排序的跨环境版本矩阵（每个包记录各环境版本——未出现为
 `null`——并标记 `shared` / `divergent`），用于快速定位跨平台锁定差异。
+两个多环境端点（`/resolve-matrix` 与 `/lock-groups`）的逐环境求解共享一个
+**请求级尝试预算**：环境按 `id` 稳定顺序执行、候选尝试次数累计计数，预算
+（环境变量 `RESOLVER_SHARED_ATTEMPT_BUDGET` 配置，默认 100000）耗尽即停止
+后续求解，整体返回 **409**（`status: "limit"`，附触发环境、已用次数与上限）。
 `/audit-lock` 对现有锁定清单做**只审计、不重新求解**的自洽性检查：按锁定
 版本从根包遍历已激活依赖，报告缺失、版本不可用、约束不满足与多余的包。
 `/dependency-paths` 在审计通过的锁定清单上**解释目标包为何出现**：按锁定
@@ -97,6 +101,22 @@ docker compose up --build
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 8000
+```
+
+### 环境变量配置
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `RESOLVER_SHARED_ATTEMPT_BUDGET` | `100000` | `/resolve-matrix` 与 `/lock-groups` 的**请求级共享尝试预算**：同一请求内全部目标环境的候选版本尝试次数累计上限。必须是正整数；值为非整数或小于 1 时**进程在启动时即失败**（配置错误不会延迟到处理请求时才暴露） |
+
+不设置该变量时按默认值运行，`docker compose up --build` 无需任何改动。
+需要调整时在 `docker-compose.yml` 中覆盖，例如：
+
+```yaml
+services:
+  dependency-resolver:
+    environment:
+      - RESOLVER_SHARED_ATTEMPT_BUDGET=200000
 ```
 
 ---
@@ -341,6 +361,15 @@ curl -s -X POST http://localhost:8000/resolve \
 每个环境**独立复用 `/resolve` 的全部求解规则**（marker 激活、MRV/回溯、
 预发布跟随语义、尝试上限），互不影响。快照与根约束只校验一次。
 
+**请求级共享尝试预算**：同一请求内全部环境的候选尝试次数**累计计数**，
+环境**按 `id` 稳定顺序**逐个求解（与请求中的提交顺序无关），因此输入重排
+后求解顺序、截断位置与响应完全一致。任一环境的求解使累计尝试次数超过预算
+上限时，**立即停止后续环境求解**，整体返回 **409**（`status: "limit"`，
+见下文示例）；此前已收集的逐环境结果（含无解环境的冲突信息）不随该响应
+返回。预算上限由环境变量 `RESOLVER_SHARED_ATTEMPT_BUDGET` 配置（默认
+100000，见「环境变量配置」）；单环境 `/resolve` 不读取该预算，其尝试上限
+语义不变。
+
 ```bash
 curl -s -X POST http://localhost:8000/resolve-matrix \
   -H 'Content-Type: application/json' \
@@ -470,12 +499,31 @@ curl -s -X POST http://localhost:8000/resolve-matrix \
 `win32` 激活：Linux 环境正常锁定，Windows 环境互斥冲突，因此整体 409 且
 `failures` 只含 `win-amd64`（409 响应不返回成功环境的锁定清单）。
 
+**请求级共享尝试预算耗尽时**返回另一种 409（不携带逐环境 `failures`）：
+
+```json
+{
+  "status": "limit",
+  "message": "请求级共享尝试预算已耗尽：环境 'win-amd64' 求解中累计尝试 100001 个候选版本，超过上限 100000；已停止后续环境求解",
+  "triggered_by": "win-amd64",
+  "attempts": 100001,
+  "limit": 100000
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `status` | 固定 `"limit"` |
+| `triggered_by` | 预算耗尽时正在求解的环境 `id`（环境按 `id` 稳定顺序求解） |
+| `attempts` | 截至停止时，本请求内全部环境累计的候选版本尝试次数 |
+| `limit` | 请求级共享尝试预算上限（`RESOLVER_SHARED_ATTEMPT_BUDGET`） |
+
 `/resolve-matrix` 的状态码：
 
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | 全部环境求解成功，返回按 `id` 排序的 `results`（各含 `root_version` 与 `locked`）与按包名排序的 `matrix` |
-| `409` | 至少一个环境无解或超过搜索上限：`status: "conflict"`，`failures` 按 `id` 排序列出各失败环境的原冲突结果（单环境的 `status` 也可能为 `"limit"`） |
+| `409` | 至少一个环境无解或超过单环境搜索上限：`status: "conflict"`，`failures` 按 `id` 排序列出各失败环境的原冲突结果（单环境的 `status` 也可能为 `"limit"`）；或请求级共享尝试预算耗尽：`status: "limit"`，附 `triggered_by` / `attempts` / `limit` |
 | `422` | 请求/快照非法（同 `/resolve`），或环境数量不在 2～8、`id` 非法、**`id` 重复** |
 
 ### `POST /lock-groups`
@@ -494,7 +542,12 @@ curl -s -X POST http://localhost:8000/resolve-matrix \
    `failures` 按 `id` 排序列出各失败环境的原冲突结果——内容与
    `/resolve-matrix` 的 409、以及对该环境单独调用 `/resolve` 得到的 409
    完全一致（`status` / `message` / `conflicts` 约束来源链），成功环境的
-   锁不随 409 返回；
+   锁不随 409 返回。逐环境求解与 `/resolve-matrix` 共享同一套**请求级
+   尝试预算**语义：环境按 `id` 稳定顺序求解、候选尝试次数累计计数，预算
+   （`RESOLVER_SHARED_ATTEMPT_BUDGET`，默认 100000）耗尽即停止后续求解，
+   整体返回 **409**（`status: "limit"`，附 `triggered_by` / `attempts` /
+   `limit`，形态与 `/resolve-matrix` 的预算耗尽响应一致），不再进入后续
+   交叉校验；
 2. **候选锁按内容去重**：来自不同环境但锁内容（规范化包名 → 版本）完全
    相同的候选只保留一份——它们本就是同一份锁文件；
 3. **跨环境交叉校验**：把去重后的**每一份候选锁**当作 `current_lock`，在
@@ -614,7 +667,7 @@ curl -s -X POST http://localhost:8000/lock-groups \
 | 状态码 | 含义 |
 | --- | --- |
 | `200` | 全部环境求解成功且完成交叉校验，返回覆盖全部环境的最少锁组（按稳定组 id 排序） |
-| `409` | 至少一个环境无解或超过搜索上限：`status: "conflict"`，`failures` 按 `id` 排序列出各失败环境与 `/resolve` 同形的原冲突结果（保留冲突来源链；单环境的 `status` 也可能为 `"limit"`） |
+| `409` | 至少一个环境无解或超过单环境搜索上限：`status: "conflict"`，`failures` 按 `id` 排序列出各失败环境与 `/resolve` 同形的原冲突结果（保留冲突来源链；单环境的 `status` 也可能为 `"limit"`）；或请求级共享尝试预算耗尽：`status: "limit"`，附 `triggered_by` / `attempts` / `limit` |
 | `422` | 请求/快照非法（同 `/resolve`），或环境数量不在 2～8、`id` 非法、**`id` 重复** |
 
 ### `POST /upgrade`
@@ -1557,11 +1610,16 @@ curl -s -X POST http://localhost:8000/explain-version \
     输出与输入顺序无关。
 13. **跨环境矩阵（`/resolve-matrix`）**：对同一份快照与根约束，在 2～8 个
     带唯一 `id` 的目标环境上各跑一遍第 2～8 条的同一套求解（环境间完全
-    独立、各自回溯与冲突收集）。全部成功时 `results` 按 `id` 排序给出各
-    环境锁定清单，`matrix` 按包名排序逐包记录各环境版本（未出现为
-    `null`）：所有环境都存在且版本一致为 `shared`，否则（版本不同或仅部分
-    环境出现）为 `divergent`；任一环境无解则整体 409，`failures` 按 `id`
-    排序给出各失败环境与 `/resolve` 同形的原冲突结果。
+    独立、各自回溯与冲突收集）。环境**按 `id` 稳定顺序**执行，且全部环境
+    共享一个**请求级尝试预算**（候选尝试次数累计计数，上限由环境变量
+    `RESOLVER_SHARED_ATTEMPT_BUDGET` 配置，默认 100000）：任一环境求解使
+    累计次数超过上限即停止后续求解，整体返回 409（`status: "limit"`，附
+    触发环境、已用次数与上限）；输入重排后截断位置与响应一致。全部成功时
+    `results` 按 `id` 排序给出各环境锁定清单，`matrix` 按包名排序逐包记录
+    各环境版本（未出现为 `null`）：所有环境都存在且版本一致为 `shared`，
+    否则（版本不同或仅部分环境出现）为 `divergent`；任一环境无解则整体
+    409，`failures` 按 `id` 排序给出各失败环境与 `/resolve` 同形的原冲突
+    结果。
 14. **物料清单（`/sbom`）**：先复用第 10 条的审计，锁无效即返回 409 且不
     导出；锁有效时沿第 11 条的已激活依赖图（按锁定版本、无版本选择）逐包
     导出规范化名称、版本、PURL（`pkg:pypi/<name>@<version>`）、已激活
@@ -1597,7 +1655,9 @@ curl -s -X POST http://localhost:8000/explain-version \
     说明阻塞原因，钉版本约束本身作为一条根级来源链出现。两次求解各自
     使用独立的求解器实例，互不影响冲突收集与尝试计数。
 18. **最少锁组（`/lock-groups`）**：请求与第 13 条的 `/resolve-matrix`
-    相同。先逐环境复用第 2～8 条各求一份候选锁，任一环境无解即整体 409
+    相同。先逐环境复用第 2～8 条各求一份候选锁（与第 13 条共享同一套
+    请求级尝试预算语义：按 `id` 稳定顺序求解、累计计数，预算耗尽即整体
+    409 `status: "limit"`），任一环境无解即整体 409
     并按 id 排序保留各失败环境与 `/resolve` 同形的原冲突结果（继续跑完
     其余环境）；全部有解后候选锁按锁内容（规范化包名 → 版本）去重，每份
     候选锁在每个环境上再按第 10 条的同一套审计规则交叉校验（marker 按被
@@ -1612,6 +1672,11 @@ curl -s -X POST http://localhost:8000/explain-version \
 
 - **尝试上限**（默认 100,000 次候选展开）：防止恶意构造的快照造成指数级搜索，
   超出返回 `409 / status:"limit"`。
+- **请求级共享尝试预算**（`/resolve-matrix` 与 `/lock-groups`，默认 100,000 次）：
+  同一请求内全部环境的候选尝试次数累计计数，环境按 `id` 稳定顺序求解；
+  预算耗尽即停止后续环境求解，整体返回 `409 / status:"limit"`（附触发环境、
+  已用次数与上限）。上限由环境变量 `RESOLVER_SHARED_ATTEMPT_BUDGET` 配置，
+  非法值（非正整数）导致进程启动失败；单环境 `/resolve` 不读取该预算。
 - **依赖链深度上限**（默认 5,000 层）：超出同样以 `limit` 报出，而不是进程栈溢出。
 
 ## 四、项目结构
@@ -1619,7 +1684,8 @@ curl -s -X POST http://localhost:8000/explain-version \
 ```
 app/
   main.py           # FastAPI 路由与错误映射
-  resolver.py       # 回溯求解器（候选排序 / MRV / 来源链重建）
+  config.py         # 进程级配置（环境变量解析，非法配置启动即失败）
+  resolver.py       # 回溯求解器（候选排序 / MRV / 来源链重建 / 请求级共享预算）
   audit.py          # 锁定清单审计（按锁版本遍历 / 环中累计入边 / 四类问题）
   paths.py          # 锁定依赖图建图与根包到目标包的全部最短路径（菱形/环安全）
   install_plan.py   # 有效锁图 SCC 压缩为 DAG 与依赖优先并行安装批次（循环分量原子项）

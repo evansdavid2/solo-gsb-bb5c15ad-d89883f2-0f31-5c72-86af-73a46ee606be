@@ -5,6 +5,10 @@ services:
     container_name: dependency-resolver
     ports:
       - "8000:8000"
+    # 可选：/resolve-matrix 与 /lock-groups 的请求级共享尝试预算上限
+    # （正整数，默认 100000；非法值会导致进程启动失败）
+    # environment:
+    #   - RESOLVER_SHARED_ATTEMPT_BUDGET=200000
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=2).status==200 else 1)"]

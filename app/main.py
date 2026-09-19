@@ -6,13 +6,15 @@
   同一份快照 + 根约束 + 2～8 个带唯一 id 的目标环境：逐环境复用 /resolve
   规则求解，全部成功时返回按 id 排序的各环境 locked 与按包名排序的跨环境
   版本矩阵（shared/divergent）；任一环境无解则整体 409，列出各失败环境的
-  原冲突结果
+  原冲突结果。同一请求内全部环境共享一个请求级尝试预算（按 id 稳定顺序
+  求解、累计计数），预算耗尽即停止后续求解并整体 409（status=limit）
 * POST /lock-groups
   请求同 /resolve-matrix：先逐环境复用 /resolve 规则各求一份候选锁，任一
   环境无解则整体 409 并保留该环境的冲突来源链；全部有解后把去重后的每份
   候选锁在所有环境上按 /audit-lock 规则交叉校验，精确选择“覆盖全部环境的
   锁文件数量最少”的锁组，并列最优按锁内容及环境 id 的稳定序裁决；响应按
-  稳定组 id 排列，每组给出覆盖环境与锁内容，同一输入结果确定
+  稳定组 id 排列，每组给出覆盖环境与锁内容，同一输入结果确定。逐环境求解
+  阶段与 /resolve-matrix 共享同一套请求级尝试预算语义
 * POST /upgrade     在 /resolve 语义基础上附加 current_lock 与单个升级目标：
   仅考虑严格高于当前版本的候选，取能完成整体解析的最高版本，并在该版本
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
@@ -55,11 +57,14 @@
 
 from __future__ import annotations
 
+from typing import Union
+
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 from packaging.version import Version
 
 from .audit import audit_lock
+from .config import SHARED_ATTEMPT_BUDGET
 from .install_plan import build_install_plan
 from .license_policy import evaluate_license_policy
 from .lock_diff import diff_locks
@@ -79,7 +84,12 @@ from .repository import (
     parse_root_specifier,
     parse_target_version,
 )
-from .resolver import ResolutionLimit, Resolver
+from .resolver import (
+    ResolutionLimit,
+    Resolver,
+    SharedAttemptBudget,
+    SharedBudgetExhausted,
+)
 from .sbom import build_sbom
 from .schemas import (
     AuditLockRequest,
@@ -99,6 +109,7 @@ from .schemas import (
     LockDiffResponse,
     LockGroupsRequest,
     LockGroupsResponse,
+    MatrixLimitResponse,
     ResolveMatrixRequest,
     ResolveMatrixResponse,
     MatrixUnresolvedResponse,
@@ -119,7 +130,7 @@ app = FastAPI(
         "所有仓库数据与目标环境随请求提交，本地解析，不访问任何远程索引、"
         "不读取宿主机平台信息。"
     ),
-    version="1.10.0",
+    version="1.11.0",
 )
 
 
@@ -165,20 +176,25 @@ def _resolve_once(
     root_canonical: str,
     specifier: str,
     allow_prereleases: bool,
+    budget: SharedAttemptBudget | None = None,
 ) -> tuple[dict | None, dict | None]:
     """按 /resolve 的既有规则对单个目标环境求解一次。
 
     返回 ``(ok_payload, conflict_payload)``，二者恰有一个非 None：
 
     * 成功：``ok_payload`` 为 build_output 的 200 响应体；
-    * 无解或超上限：``conflict_payload`` 为 _conflict_payload 的 409 响应体。
+    * 无解或超单环境上限：``conflict_payload`` 为 _conflict_payload 的 409
+      响应体。
 
-    快照/约束构造期的 SnapshotError 不在此捕获，由调用方映射为 422。
+    ``budget`` 非 None 时本次求解的候选尝试计入该请求级共享预算；预算耗尽
+    抛 SharedBudgetExhausted（不在此转换为响应体，由路由层映射为整体 409
+    limit 响应）。快照/约束构造期的 SnapshotError 不在此捕获，由调用方映射
+    为 422。
     """
     repo = build_repository(repository_payload, target_environment)
     root_spec = parse_root_specifier(specifier)
 
-    resolver = Resolver(repo, allow_prereleases=allow_prereleases)
+    resolver = Resolver(repo, allow_prereleases=allow_prereleases, budget=budget)
     try:
         state = resolver.resolve(root_canonical, root_spec, specifier)
     except ResolutionLimit:
@@ -187,6 +203,30 @@ def _resolve_once(
     if state is not None:
         return resolver.build_output(state, root_canonical), None
     return None, _conflict_payload(resolver.build_conflicts())
+
+
+def _budget_limit_response(
+    env_id: str, budget: SharedAttemptBudget
+) -> JSONResponse:
+    """请求级共享尝试预算耗尽的整体 409（status=limit）响应。
+
+    环境按 id 稳定顺序求解，``env_id`` 为预算耗尽时正在求解的环境；
+    响应只取决于预算计数与该环境 id，与环境在请求中的提交顺序无关。
+    """
+    return JSONResponse(
+        status_code=409,
+        content={
+            "status": "limit",
+            "message": (
+                f"请求级共享尝试预算已耗尽：环境 {env_id!r} 求解中累计尝试 "
+                f"{budget.used} 个候选版本，超过上限 {budget.limit}；"
+                "已停止后续环境求解"
+            ),
+            "triggered_by": env_id,
+            "attempts": budget.used,
+            "limit": budget.limit,
+        },
+    )
 
 
 @app.post(
@@ -244,8 +284,11 @@ def resolve(request: ResolveRequest):
     response_model=ResolveMatrixResponse,
     responses={
         409: {
-            "model": MatrixUnresolvedResponse,
-            "description": "任一目标环境无解：列出各失败环境的原冲突结果",
+            "model": Union[MatrixUnresolvedResponse, MatrixLimitResponse],
+            "description": (
+                "任一目标环境无解（列出各失败环境的原冲突结果），"
+                "或请求级共享尝试预算耗尽"
+            ),
         },
         422: {"model": InvalidSnapshotResponse, "description": "快照或请求非法（含重复 id）"},
     },
@@ -291,9 +334,13 @@ def resolve_matrix(request: ResolveMatrixRequest):
 
     # 逐环境独立求解：每个环境一个全新 Resolver，冲突收集互不干扰；
     # 即使某环境已无解也继续跑完全部环境，以便 409 列出所有失败环境。
+    # 环境按 id 稳定顺序执行，且全部环境共享同一个请求级尝试预算：
+    # 预算耗尽即停止后续求解，整体返回 409（status=limit）；输入重排后
+    # 截断位置与响应保持一致。
+    budget = SharedAttemptBudget(SHARED_ATTEMPT_BUDGET)
     successes: dict[str, dict] = {}
     failures: list[dict] = []
-    for env in payload["target_environments"]:
+    for env in sorted(payload["target_environments"], key=lambda e: e["id"]):
         env_id = env["id"]
         try:
             ok, conflict = _resolve_once(
@@ -302,7 +349,10 @@ def resolve_matrix(request: ResolveMatrixRequest):
                 root_canonical=root_canonical,
                 specifier=request.specifier,
                 allow_prereleases=request.allow_prereleases,
+                budget=budget,
             )
+        except SharedBudgetExhausted:
+            return _budget_limit_response(env_id, budget)
         except SnapshotError as exc:
             return JSONResponse(
                 status_code=422,
@@ -370,8 +420,11 @@ def resolve_matrix(request: ResolveMatrixRequest):
     response_model=LockGroupsResponse,
     responses={
         409: {
-            "model": MatrixUnresolvedResponse,
-            "description": "任一目标环境无解：列出各失败环境的原冲突结果",
+            "model": Union[MatrixUnresolvedResponse, MatrixLimitResponse],
+            "description": (
+                "任一目标环境无解（列出各失败环境的原冲突结果），"
+                "或请求级共享尝试预算耗尽"
+            ),
         },
         422: {"model": InvalidSnapshotResponse, "description": "快照或请求非法（含重复 id）"},
     },
@@ -417,9 +470,12 @@ def lock_groups(request: LockGroupsRequest):
 
     # 第一步：逐环境独立复用 /resolve 规则求解；即使某环境已无解也继续跑完
     # 全部环境，以便 409 一次性列出所有失败环境（与 /resolve-matrix 同形）。
+    # 环境按 id 稳定顺序执行，且全部环境共享同一个请求级尝试预算：预算耗尽
+    # 即停止后续求解，整体返回 409（status=limit），不做交叉校验。
+    budget = SharedAttemptBudget(SHARED_ATTEMPT_BUDGET)
     env_locks: dict[str, dict[str, str]] = {}
     failures: list[dict] = []
-    for env in payload["target_environments"]:
+    for env in sorted(payload["target_environments"], key=lambda e: e["id"]):
         env_id = env["id"]
         try:
             ok, conflict = _resolve_once(
@@ -428,7 +484,10 @@ def lock_groups(request: LockGroupsRequest):
                 root_canonical=root_canonical,
                 specifier=request.specifier,
                 allow_prereleases=request.allow_prereleases,
+                budget=budget,
             )
+        except SharedBudgetExhausted:
+            return _budget_limit_response(env_id, budget)
         except SnapshotError as exc:
             return JSONResponse(
                 status_code=422,
