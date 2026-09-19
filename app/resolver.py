@@ -25,6 +25,13 @@
 * 以与根需求并列的根级 ``==版本`` 约束钉住目标包后整体求解，其余规则
   （MRV、高版本优先、回溯、预发布跟随语义、尝试上限）与普通 /resolve
   完全一致；不进入升级优化模式，返回确定性顺序下的首个解。
+
+请求级共享预算（POST /resolve-matrix、/lock-groups 使用）：
+* 同一次请求内为每个目标环境新建的 Resolver 传入同一个
+  SharedAttemptBudget：候选尝试先受本实例 attempt_limit 约束（单环境
+  /resolve 的既有上限语义不变），再向共享预算计费；
+* 共享预算用尽时本次尝试被拒绝，_solve 立即上抛 _BUDGET_SENTINEL，
+  resolve() 转抛 SharedBudgetExceeded，由路由层停止后续环境的求解。
 """
 
 from __future__ import annotations
@@ -54,8 +61,46 @@ class ResolutionLimit(RuntimeError):
     """搜索超过尝试次数上限。"""
 
 
-# _solve 的返回哨兵：None=约束冲突（正常回溯失败），_LIMIT=超过尝试上限。
+class SharedBudgetExceeded(RuntimeError):
+    """请求级共享求解预算耗尽（多个 Resolver 累计的候选尝试次数超限）。"""
+
+
+# _solve 的返回哨兵：
+# None=约束冲突（正常回溯失败）；
+# _LIMIT_SENTINEL=超过本求解器实例的尝试/深度上限；
+# _BUDGET_SENTINEL=超过请求级共享预算（立即停止整个请求的后续求解）。
 _LIMIT_SENTINEL: object = object()
+_BUDGET_SENTINEL: object = object()
+
+
+class SharedAttemptBudget:
+    """多个 Resolver 实例共享、跨环境累计的候选尝试预算。
+
+    用于 /resolve-matrix 与 /lock-groups：同一次请求内各环境的候选
+    尝试次数累加到 ``used``，``charge`` 在累计值超过 ``limit`` 时返回
+    False（调用方立即放弃该次尝试并沿递归上抛 _BUDGET_SENTINEL）。
+    预算只统计真正进入候选循环的尝试，与单实例 attempts 计数同源。
+    """
+
+    __slots__ = ("limit", "used")
+
+    def __init__(self, limit: int):
+        if limit <= 0:
+            raise ValueError("共享尝试预算必须为正整数")
+        self.limit = limit
+        self.used = 0
+
+    def charge(self, count: int = 1) -> bool:
+        """登记 count 次尝试并返回该次尝试是否被允许。
+
+        预算已满（``used`` 恒不超过 ``limit``）时拒绝，由调用方中止求解；
+        恰好用尽预算（used==limit）的那次尝试仍允许执行，下一次才被拒绝，
+        因此超限时 ``used`` 恰等于 ``limit``，可直接用于对外报告。
+        """
+        if self.used >= self.limit:
+            return False
+        self.used = min(self.limit, self.used + count)
+        return True
 
 
 @dataclass(frozen=True)
@@ -171,11 +216,16 @@ class Resolver:
         allow_prereleases: bool = False,
         attempt_limit: int = DEFAULT_ATTEMPT_LIMIT,
         depth_limit: int = DEFAULT_DEPTH_LIMIT,
+        shared_budget: SharedAttemptBudget | None = None,
     ):
         self.repo = repository
         self.allow_prereleases = allow_prereleases
         self.attempt_limit = attempt_limit
         self.depth_limit = depth_limit
+        # 可选的请求级共享预算：/resolve-matrix、/lock-groups 为同一次请求
+        # 内的每个环境传入同一个实例累计计数；None 表示单环境接口，
+        # 只受 attempt_limit / depth_limit 约束，语义不变。
+        self.shared_budget = shared_budget
         self.attempts = 0
         self.max_depth = 0
         # subject -> 跨失败分支累积的去重来源链。
@@ -258,6 +308,12 @@ class Resolver:
         root_req = Requirement(root_name, root_spec, root_raw.strip() or "*", None, 0)
         state = State()
         result = self._solve(state, [root_req, *(extra_requirements or ())], depth=0)
+        if result is _BUDGET_SENTINEL:
+            # 请求级共享预算耗尽：触发环境与对外消息由路由层拼装。
+            assert self.shared_budget is not None
+            raise SharedBudgetExceeded(
+                f"请求级共享求解预算耗尽：已尝试 {self.shared_budget.used} 个候选版本"
+            )
         if result is _LIMIT_SENTINEL:
             if self.max_depth > self.depth_limit:
                 raise ResolutionLimit(
@@ -499,8 +555,14 @@ class Resolver:
         # --- 第四步：候选版本从高到低，逐版本克隆分支尝试 --------------
         for cand in eligible:
             self.attempts += 1
+            # 单实例上限优先（与 /resolve 的既有上限语义一致）：命中即按本
+            # 环境 limit 处理，不再占用请求级共享预算。
             if self.attempts > self.attempt_limit:
                 return _LIMIT_SENTINEL
+            # 请求级共享预算：预算已被本请求前序尝试用完时立即中止，
+            # 沿递归上抛以停止本次请求后续环境的求解。
+            if self.shared_budget is not None and not self.shared_budget.charge():
+                return _BUDGET_SENTINEL
 
             branch = state.clone()
             branch.selection[chosen] = cand.version
@@ -523,6 +585,8 @@ class Resolver:
                 for order, dep in enumerate(cand.deps)
             ]
             result = self._solve(branch, introduced + rest, depth=depth + 1)
+            if result is _BUDGET_SENTINEL:
+                return _BUDGET_SENTINEL
             if result is _LIMIT_SENTINEL:
                 return _LIMIT_SENTINEL
             if result is not None:

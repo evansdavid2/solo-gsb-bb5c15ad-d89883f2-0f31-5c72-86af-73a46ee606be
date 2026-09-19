@@ -539,6 +539,33 @@ class MatrixUnresolvedResponse(BaseModel):
     failures: list[MatrixFailureOut]
 
 
+class MatrixLimitResponse(BaseModel):
+    """请求级共享求解预算耗尽：整体 409，立即停止后续环境求解。
+
+    与 MatrixUnresolvedResponse 互斥：单个环境自身的尝试上限仍以
+    ``failures`` 中该环境 ``status:"limit"`` 的冲突结果报告（继续跑完全部
+    环境）；只有同请求内跨环境累计计数达到共享预算上限时才返回本形态。
+    """
+
+    model_config = {"extra": "forbid"}
+
+    status: Literal["limit"]
+    message: str
+    environment: str = Field(
+        ...,
+        description=(
+            "触发预算耗尽的环境 id：各环境按 id 稳定顺序执行，"
+            "该值只取决于环境集合，与请求中的提交顺序无关。"
+        ),
+    )
+    used: int = Field(
+        ..., description="停止时同请求内各环境累计已尝试的候选版本次数（恰等于 limit）。"
+    )
+    limit: int = Field(
+        ..., description="请求级共享求解预算上限（环境变量 MATRIX_ATTEMPT_LIMIT 配置）。"
+    )
+
+
 # --------------------------------------------------------------------- #
 # POST /lock-groups 响应
 # --------------------------------------------------------------------- #

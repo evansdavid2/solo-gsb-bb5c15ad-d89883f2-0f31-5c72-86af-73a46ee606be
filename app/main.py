@@ -3,16 +3,20 @@
 * POST /resolve     提交仓库快照 + 根包 + 版本约束 + 目标环境（PEP 508 marker
   在请求环境下求值），返回锁定清单或冲突来源链
 * POST /resolve-matrix
-  同一份快照 + 根约束 + 2～8 个带唯一 id 的目标环境：逐环境复用 /resolve
-  规则求解，全部成功时返回按 id 排序的各环境 locked 与按包名排序的跨环境
-  版本矩阵（shared/divergent）；任一环境无解则整体 409，列出各失败环境的
-  原冲突结果
+  同一份快照 + 根约束 + 2～8 个带唯一 id 的目标环境：按 id 稳定顺序逐
+  环境复用 /resolve 规则求解，全部成功时返回按 id 排序的各环境 locked
+  与按包名排序的跨环境版本矩阵（shared/divergent）；任一环境无解则整体
+  409，列出各失败环境的原冲突结果。同请求各环境的候选尝试次数累计到
+  请求级共享预算（环境变量 MATRIX_ATTEMPT_LIMIT），耗尽即立即停止后续
+  求解并返回 409 status=limit（触发环境、已用次数与上限）
 * POST /lock-groups
-  请求同 /resolve-matrix：先逐环境复用 /resolve 规则各求一份候选锁，任一
-  环境无解则整体 409 并保留该环境的冲突来源链；全部有解后把去重后的每份
-  候选锁在所有环境上按 /audit-lock 规则交叉校验，精确选择“覆盖全部环境的
-  锁文件数量最少”的锁组，并列最优按锁内容及环境 id 的稳定序裁决；响应按
-  稳定组 id 排列，每组给出覆盖环境与锁内容，同一输入结果确定
+  请求同 /resolve-matrix：先按 id 稳定顺序逐环境复用 /resolve 规则各求
+  一份候选锁（共享同一请求级求解预算，预算耗尽同样立即返回 409
+  status=limit），任一环境无解则整体 409 并保留该环境的冲突来源链；全部
+  有解后把去重后的每份候选锁在所有环境上按 /audit-lock 规则交叉校验，
+  精确选择“覆盖全部环境的锁文件数量最少”的锁组，并列最优按锁内容及
+  环境 id 的稳定序裁决；响应按稳定组 id 排列，每组给出覆盖环境与锁内容，
+  同一输入结果确定
 * POST /upgrade     在 /resolve 语义基础上附加 current_lock 与单个升级目标：
   仅考虑严格高于当前版本的候选，取能完成整体解析的最高版本，并在该版本
   的所有有效解中最小化非目标包相对 current_lock 的变化数量
@@ -60,6 +64,7 @@ from fastapi.responses import JSONResponse
 from packaging.version import Version
 
 from .audit import audit_lock
+from .config import MATRIX_ATTEMPT_LIMIT
 from .install_plan import build_install_plan
 from .license_policy import evaluate_license_policy
 from .lock_diff import diff_locks
@@ -79,7 +84,12 @@ from .repository import (
     parse_root_specifier,
     parse_target_version,
 )
-from .resolver import ResolutionLimit, Resolver
+from .resolver import (
+    ResolutionLimit,
+    Resolver,
+    SharedAttemptBudget,
+    SharedBudgetExceeded,
+)
 from .sbom import build_sbom
 from .schemas import (
     AuditLockRequest,
@@ -101,6 +111,7 @@ from .schemas import (
     LockGroupsResponse,
     ResolveMatrixRequest,
     ResolveMatrixResponse,
+    MatrixLimitResponse,
     MatrixUnresolvedResponse,
     ResolveRequest,
     ResolveResponse,
@@ -165,20 +176,28 @@ def _resolve_once(
     root_canonical: str,
     specifier: str,
     allow_prereleases: bool,
+    shared_budget: SharedAttemptBudget | None = None,
 ) -> tuple[dict | None, dict | None]:
     """按 /resolve 的既有规则对单个目标环境求解一次。
 
     返回 ``(ok_payload, conflict_payload)``，二者恰有一个非 None：
 
     * 成功：``ok_payload`` 为 build_output 的 200 响应体；
-    * 无解或超上限：``conflict_payload`` 为 _conflict_payload 的 409 响应体。
+    * 无解或超单环境上限：``conflict_payload`` 为 _conflict_payload 的 409 响应体。
 
-    快照/约束构造期的 SnapshotError 不在此捕获，由调用方映射为 422。
+    ``shared_budget`` 非 None 时（/resolve-matrix、/lock-groups），候选
+    尝试还会计入请求级共享预算；预算耗尽抛出 SharedBudgetExceeded，由
+    调用方停止后续环境的求解。快照/约束构造期的 SnapshotError 不在此
+    捕获，由调用方映射为 422。
     """
     repo = build_repository(repository_payload, target_environment)
     root_spec = parse_root_specifier(specifier)
 
-    resolver = Resolver(repo, allow_prereleases=allow_prereleases)
+    resolver = Resolver(
+        repo,
+        allow_prereleases=allow_prereleases,
+        shared_budget=shared_budget,
+    )
     try:
         state = resolver.resolve(root_canonical, root_spec, specifier)
     except ResolutionLimit:
@@ -187,6 +206,33 @@ def _resolve_once(
     if state is not None:
         return resolver.build_output(state, root_canonical), None
     return None, _conflict_payload(resolver.build_conflicts())
+
+
+def _ordered_matrix_environments(payload: dict) -> list[dict]:
+    """请求环境按 id 的稳定顺序排列。
+
+    两个多环境接口必须按 id 升序逐环境求解：使请求级共享预算的截断位置
+    （在哪个环境耗尽预算）只取决于环境集合、与提交顺序无关，从而输入
+    重排后 409 截断响应也逐字节一致。
+    """
+    return sorted(payload["target_environments"], key=lambda env: env["id"])
+
+
+def _matrix_limit_payload(
+    *, env_id: str, budget: SharedAttemptBudget
+) -> dict:
+    """请求级共享预算耗尽的 409 响应体。"""
+    return {
+        "status": "limit",
+        "message": (
+            f"请求级共享求解预算在环境 {env_id!r} 的求解中耗尽："
+            f"各目标环境累计已尝试 {budget.used} 个候选版本，"
+            f"达到上限 {budget.limit}；后续环境已停止求解"
+        ),
+        "environment": env_id,
+        "used": budget.used,
+        "limit": budget.limit,
+    }
 
 
 @app.post(
@@ -244,8 +290,11 @@ def resolve(request: ResolveRequest):
     response_model=ResolveMatrixResponse,
     responses={
         409: {
-            "model": MatrixUnresolvedResponse,
-            "description": "任一目标环境无解：列出各失败环境的原冲突结果",
+            "model": MatrixUnresolvedResponse | MatrixLimitResponse,
+            "description": (
+                "任一目标环境无解：列出各失败环境的原冲突结果（status=conflict）；"
+                "或请求级共享求解预算耗尽（status=limit，立即停止后续环境求解）"
+            ),
         },
         422: {"model": InvalidSnapshotResponse, "description": "快照或请求非法（含重复 id）"},
     },
@@ -253,6 +302,10 @@ def resolve(request: ResolveRequest):
 def resolve_matrix(request: ResolveMatrixRequest):
     root_canonical = canonical(request.root)
     payload = request.model_dump()
+
+    # 环境必须按 id 稳定顺序执行：请求级共享预算的截断位置、成功/失败
+    # 集合与响应均只取决于环境集合，与提交顺序无关。
+    ordered_environments = _ordered_matrix_environments(payload)
 
     # id 唯一性在路由层校验：Pydantic 的 pattern/min_length 负责格式，
     # 重复值在此返回 422，不进入任何求解。
@@ -271,7 +324,7 @@ def resolve_matrix(request: ResolveMatrixRequest):
     # marker 解析/求值与根约束非法属于 422；根包只查一次（与环境无关）。
     try:
         repo_known = build_repository(
-            payload["repository"], payload["target_environments"][0]
+            payload["repository"], ordered_environments[0]
         )
         parse_root_specifier(request.specifier)
     except SnapshotError as exc:
@@ -290,10 +343,13 @@ def resolve_matrix(request: ResolveMatrixRequest):
         )
 
     # 逐环境独立求解：每个环境一个全新 Resolver，冲突收集互不干扰；
-    # 即使某环境已无解也继续跑完全部环境，以便 409 列出所有失败环境。
+    # 但候选尝试次数累计到请求级共享预算。即使某环境已无解也继续跑完
+    # 其余环境，以便 409 列出所有失败环境；仅共享预算耗尽时立即停止
+    # 后续求解（返回 status=limit）。
+    budget = SharedAttemptBudget(MATRIX_ATTEMPT_LIMIT)
     successes: dict[str, dict] = {}
     failures: list[dict] = []
-    for env in payload["target_environments"]:
+    for env in ordered_environments:
         env_id = env["id"]
         try:
             ok, conflict = _resolve_once(
@@ -302,11 +358,17 @@ def resolve_matrix(request: ResolveMatrixRequest):
                 root_canonical=root_canonical,
                 specifier=request.specifier,
                 allow_prereleases=request.allow_prereleases,
+                shared_budget=budget,
             )
         except SnapshotError as exc:
             return JSONResponse(
                 status_code=422,
                 content={"status": "invalid_snapshot", "message": str(exc)},
+            )
+        except SharedBudgetExceeded:
+            return JSONResponse(
+                status_code=409,
+                content=_matrix_limit_payload(env_id=env_id, budget=budget),
             )
         if ok is not None:
             successes[env_id] = ok
@@ -370,8 +432,11 @@ def resolve_matrix(request: ResolveMatrixRequest):
     response_model=LockGroupsResponse,
     responses={
         409: {
-            "model": MatrixUnresolvedResponse,
-            "description": "任一目标环境无解：列出各失败环境的原冲突结果",
+            "model": MatrixUnresolvedResponse | MatrixLimitResponse,
+            "description": (
+                "任一目标环境无解：列出各失败环境的原冲突结果（status=conflict）；"
+                "或请求级共享求解预算耗尽（status=limit，立即停止后续环境求解）"
+            ),
         },
         422: {"model": InvalidSnapshotResponse, "description": "快照或请求非法（含重复 id）"},
     },
@@ -379,6 +444,10 @@ def resolve_matrix(request: ResolveMatrixRequest):
 def lock_groups(request: LockGroupsRequest):
     root_canonical = canonical(request.root)
     payload = request.model_dump()
+
+    # 环境按 id 稳定顺序执行（与 /resolve-matrix 一致），保证共享预算
+    # 截断位置与环境提交顺序无关。
+    ordered_environments = _ordered_matrix_environments(payload)
 
     # id 唯一性在路由层校验（与 /resolve-matrix 完全一致）：重复值返回 422，
     # 不进入任何求解。
@@ -397,7 +466,7 @@ def lock_groups(request: LockGroupsRequest):
     # marker 解析/求值与根约束非法属于 422；根包只查一次（与环境无关）。
     try:
         repo_known = build_repository(
-            payload["repository"], payload["target_environments"][0]
+            payload["repository"], ordered_environments[0]
         )
         root_spec = parse_root_specifier(request.specifier)
     except SnapshotError as exc:
@@ -417,9 +486,11 @@ def lock_groups(request: LockGroupsRequest):
 
     # 第一步：逐环境独立复用 /resolve 规则求解；即使某环境已无解也继续跑完
     # 全部环境，以便 409 一次性列出所有失败环境（与 /resolve-matrix 同形）。
+    # 各环境候选尝试累计到请求级共享预算，预算耗尽立即停止后续求解。
+    budget = SharedAttemptBudget(MATRIX_ATTEMPT_LIMIT)
     env_locks: dict[str, dict[str, str]] = {}
     failures: list[dict] = []
-    for env in payload["target_environments"]:
+    for env in ordered_environments:
         env_id = env["id"]
         try:
             ok, conflict = _resolve_once(
@@ -428,11 +499,17 @@ def lock_groups(request: LockGroupsRequest):
                 root_canonical=root_canonical,
                 specifier=request.specifier,
                 allow_prereleases=request.allow_prereleases,
+                shared_budget=budget,
             )
         except SnapshotError as exc:
             return JSONResponse(
                 status_code=422,
                 content={"status": "invalid_snapshot", "message": str(exc)},
+            )
+        except SharedBudgetExceeded:
+            return JSONResponse(
+                status_code=409,
+                content=_matrix_limit_payload(env_id=env_id, budget=budget),
             )
         if ok is not None:
             env_locks[env_id] = ok["locked"]
@@ -464,7 +541,7 @@ def lock_groups(request: LockGroupsRequest):
     # 无任何审计问题时该锁才可覆盖该环境（marker 按被审计环境求值）。
     # 每个环境的快照只构造一次，供全部候选锁复用。
     env_repos: dict[str, Repository] = {}
-    for env in payload["target_environments"]:
+    for env in ordered_environments:
         try:
             env_repos[env["id"]] = build_repository(payload["repository"], env)
         except SnapshotError as exc:
@@ -501,7 +578,7 @@ def lock_groups(request: LockGroupsRequest):
     # 第四步：精确选择覆盖全部环境的最少锁组（候选锁 ≤ 8，直接枚举子集），
     # 并列最优按锁内容及环境 id 的稳定序裁决。
     selected = select_lock_groups(
-        candidates, [env["id"] for env in payload["target_environments"]]
+        candidates, [env["id"] for env in ordered_environments]
     )
     groups = [
         {
